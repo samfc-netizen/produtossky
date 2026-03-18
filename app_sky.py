@@ -1,3 +1,4 @@
+
 import pandas as pd
 import streamlit as st
 from pathlib import Path
@@ -37,7 +38,7 @@ def carregar_dados():
     giro["VR.TOTAL"] = pd.to_numeric(giro["VR.TOTAL"], errors="coerce").fillna(0)
     giro["CÓD"] = pd.to_numeric(giro["CÓD"], errors="coerce").astype("Int64")
 
-    for col in ["LOJA", "CLIENTE", "CIDADE", "VEN"]:
+    for col in ["LOJA", "CLIENTE", "CIDADE", "VEN", "DESCRIÇÃO"]:
         if col in giro.columns:
             giro[col] = giro[col].astype(str).str.strip()
 
@@ -217,6 +218,145 @@ def gerar_direcionamento(giro: pd.DataFrame, produtos: pd.DataFrame):
     return ranking, detalhes_produto
 
 
+def distribuir_inteiros(total: int, pesos: list[float]) -> list[int]:
+    if total <= 0 or not pesos:
+        return [0] * len(pesos)
+
+    soma = sum(pesos)
+    if soma <= 0:
+        return [0] * len(pesos)
+
+    quotas = [(total * p) / soma for p in pesos]
+    base = [int(q) for q in quotas]
+    restante = total - sum(base)
+
+    fracoes = sorted(
+        [(i, quotas[i] - base[i]) for i in range(len(quotas))],
+        key=lambda x: x[1],
+        reverse=True,
+    )
+
+    for i in range(restante):
+        idx = fracoes[i % len(fracoes)][0]
+        base[idx] += 1
+
+    return base
+
+
+@st.cache_data(show_spinner=False)
+def gerar_realocacao(giro: pd.DataFrame, produtos: pd.DataFrame):
+    giro = giro.copy()
+    giro["LOJA"] = giro["LOJA"].fillna("").astype(str).str.strip()
+
+    produtos_base = produtos[["CODIGO", "DESCRICAO", "SALDO_UNICA", "LABEL"]].copy()
+
+    vendas_loja_sku = (
+        giro.groupby(["CÓD", "LOJA"], dropna=False)
+        .agg(
+            QTD_VENDIDA=("QTD", "sum"),
+            VALOR_VENDIDO=("VR.TOTAL", "sum"),
+            ULTIMA_VENDA=("DATA", "max"),
+        )
+        .reset_index()
+        .rename(columns={"CÓD": "CODIGO"})
+    )
+
+    # lojas elegíveis para receber realocação: vendas históricas fora da ÚNICA
+    vendas_loja_sku = vendas_loja_sku[vendas_loja_sku["LOJA"].str.upper() != "ÚNICA"].copy()
+    vendas_loja_sku = vendas_loja_sku[vendas_loja_sku["QTD_VENDIDA"] > 0].copy()
+
+    base = produtos_base.merge(vendas_loja_sku, on="CODIGO", how="left")
+    base["QTD_VENDIDA"] = base["QTD_VENDIDA"].fillna(0)
+    base["VALOR_VENDIDO"] = base["VALOR_VENDIDO"].fillna(0)
+
+    registros_gerais = []
+
+    for codigo, grp in base.groupby("CODIGO", dropna=False):
+        grp = grp.copy()
+        saldo = float(grp["SALDO_UNICA"].iloc[0]) if pd.notna(grp["SALDO_UNICA"].iloc[0]) else 0
+        saldo_int = int(round(saldo))
+
+        if saldo_int <= 0:
+            continue
+
+        grp_valid = grp[grp["LOJA"].notna() & (grp["LOJA"].astype(str).str.strip() != "")]
+        grp_valid = grp_valid[grp_valid["QTD_VENDIDA"] > 0].copy()
+
+        if grp_valid.empty:
+            continue
+
+        pesos = grp_valid["QTD_VENDIDA"].tolist()
+        alocacoes = distribuir_inteiros(saldo_int, pesos)
+        grp_valid["SUGESTAO_REALOCAR"] = alocacoes
+
+        total_vendido = grp_valid["QTD_VENDIDA"].sum()
+        grp_valid["PCT_PARTICIPACAO"] = grp_valid["QTD_VENDIDA"] / total_vendido if total_vendido > 0 else 0
+
+        # Cliente mais representativo e mais recente por loja/SKU
+        vendas_prod = giro[(giro["CÓD"] == codigo) & (giro["LOJA"].str.upper() != "ÚNICA")].copy()
+        clientes_loja = (
+            vendas_prod.groupby(["LOJA", "CLIENTE"], dropna=False)
+            .agg(
+                QTD_CLIENTE=("QTD", "sum"),
+                VALOR_TOTAL=("VR.TOTAL", "sum"),
+                ULTIMA_COMPRA=("DATA", "max"),
+                PRECO_MEDIO=("UNIT", "mean"),
+            )
+            .reset_index()
+            .sort_values(
+                by=["LOJA", "QTD_CLIENTE", "ULTIMA_COMPRA", "VALOR_TOTAL", "CLIENTE"],
+                ascending=[True, False, False, False, True],
+            )
+        )
+
+        top_clientes = clientes_loja.groupby("LOJA", dropna=False).head(3).copy()
+        top_clientes["ULTIMA_COMPRA_TXT"] = pd.to_datetime(top_clientes["ULTIMA_COMPRA"], errors="coerce").dt.strftime("%d/%m/%Y")
+        clientes_resumo = (
+            top_clientes.groupby("LOJA", dropna=False)
+            .apply(
+                lambda x: " | ".join(
+                    [
+                        f"{row['CLIENTE']} ({int(row['QTD_CLIENTE'])} un | {row['ULTIMA_COMPRA_TXT']} | R$ {row['PRECO_MEDIO']:.2f})"
+                        for _, row in x.iterrows()
+                    ]
+                )
+            )
+            .reset_index(name="CLIENTES_REFERENCIA")
+        )
+
+        grp_valid = grp_valid.merge(clientes_resumo, on="LOJA", how="left")
+
+        for _, row in grp_valid.iterrows():
+            registros_gerais.append(
+                {
+                    "CODIGO": row["CODIGO"],
+                    "DESCRICAO": row["DESCRICAO"],
+                    "LABEL": row["LABEL"],
+                    "LOJA": row["LOJA"],
+                    "SALDO_UNICA": saldo_int,
+                    "QTD_VENDIDA_LOJA": row["QTD_VENDIDA"],
+                    "PCT_PARTICIPACAO": row["PCT_PARTICIPACAO"],
+                    "SUGESTAO_REALOCAR": row["SUGESTAO_REALOCAR"],
+                    "ULTIMA_VENDA_LOJA": row["ULTIMA_VENDA"],
+                    "VALOR_VENDIDO_LOJA": row["VALOR_VENDIDO"],
+                    "CLIENTES_REFERENCIA": row.get("CLIENTES_REFERENCIA", ""),
+                }
+            )
+
+    geral = pd.DataFrame(registros_gerais)
+
+    if geral.empty:
+        return geral, []
+
+    geral["ULTIMA_VENDA_LOJA"] = pd.to_datetime(geral["ULTIMA_VENDA_LOJA"], errors="coerce")
+    geral = geral.sort_values(
+        by=["LOJA", "SUGESTAO_REALOCAR", "QTD_VENDIDA_LOJA", "ULTIMA_VENDA_LOJA", "DESCRICAO"],
+        ascending=[True, False, False, False, True],
+    ).reset_index(drop=True)
+
+    lojas_disponiveis = sorted(geral["LOJA"].dropna().astype(str).unique().tolist())
+    return geral, lojas_disponiveis
+
 
 def brl(v):
     try:
@@ -225,13 +365,11 @@ def brl(v):
         return "R$ 0,00"
 
 
-
 def int_fmt(v):
     try:
         return f"{float(v):,.0f}".replace(",", ".")
     except Exception:
         return "0"
-
 
 
 def render_pagina_estoque(giro: pd.DataFrame, produtos: pd.DataFrame):
@@ -413,7 +551,6 @@ def render_pagina_estoque(giro: pd.DataFrame, produtos: pd.DataFrame):
     )
 
 
-
 def render_pagina_direcionamento(giro: pd.DataFrame, produtos: pd.DataFrame):
     ranking, detalhes_produto = gerar_direcionamento(giro, produtos)
 
@@ -555,23 +692,168 @@ def render_pagina_direcionamento(giro: pd.DataFrame, produtos: pd.DataFrame):
     with st.expander("Critério do ranking"):
         st.write(
             """
-            - O ranking das lojas por SKU considera primeiro a **quantidade vendida**, depois a **data mais recente de venda** e, em seguida, o **valor vendido**.
-            - Dentro de cada loja, os clientes são ordenados por **quantidade comprada**, **recência da compra** e **valor total**.
+            - O ranking das lojas por SKU considera primeiro a quantidade vendida, depois a data mais recente de venda e, em seguida, o valor vendido.
+            - Dentro de cada loja, os clientes são ordenados por quantidade comprada, recência da compra e valor total.
             - O objetivo é sugerir para onde o estoque da Única pode ser direcionado com base no histórico real da planilha.
             """
         )
 
+
+def render_pagina_realocacao(giro: pd.DataFrame, produtos: pd.DataFrame):
+    geral, lojas_disponiveis = gerar_realocacao(giro, produtos)
+
+    st.title("Sky - Sugestão de Realocação por Loja")
+    st.caption("Distribuição proporcional do saldo da Única entre as lojas, com base no histórico de quantidade vendida por SKU.")
+
+    if geral.empty:
+        st.warning("Não encontrei SKUs com saldo na Única e vendas históricas fora da loja ÚNICA para sugerir realocação.")
+        return
+
+    with st.sidebar:
+        st.header("Filtros da realocação")
+        loja_escolhida = st.selectbox("Selecione a loja", lojas_disponiveis, index=0, key="loja_realoc")
+        busca_realoc = st.text_input("Buscar SKU / descrição", key="busca_realoc")
+        somente_sugestao = st.checkbox("Mostrar apenas SKUs com sugestão > 0", value=True, key="so_sug_maior_zero")
+
+    base_loja = geral[geral["LOJA"] == loja_escolhida].copy()
+
+    if busca_realoc:
+        termo = busca_realoc.strip().lower()
+        base_loja = base_loja[base_loja["LABEL"].str.lower().str.contains(termo, na=False)]
+
+    if somente_sugestao:
+        base_loja = base_loja[base_loja["SUGESTAO_REALOCAR"] > 0]
+
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Loja", loja_escolhida)
+    k2.metric("SKUs sugeridos", int_fmt(len(base_loja)))
+    k3.metric("Unidades sugeridas", int_fmt(base_loja["SUGESTAO_REALOCAR"].sum()))
+    k4.metric("Saldo Única considerado", int_fmt(base_loja["SALDO_UNICA"].sum()))
+
+    st.subheader(f"SKUs sugeridos para {loja_escolhida}")
+
+    tabela = base_loja[
+        [
+            "CODIGO",
+            "DESCRICAO",
+            "SALDO_UNICA",
+            "QTD_VENDIDA_LOJA",
+            "PCT_PARTICIPACAO",
+            "SUGESTAO_REALOCAR",
+            "ULTIMA_VENDA_LOJA",
+            "VALOR_VENDIDO_LOJA",
+            "CLIENTES_REFERENCIA",
+        ]
+    ].copy()
+
+    tabela["ULTIMA_VENDA_LOJA"] = pd.to_datetime(tabela["ULTIMA_VENDA_LOJA"], errors="coerce").dt.strftime("%d/%m/%Y")
+    tabela = tabela.rename(
+        columns={
+            "CODIGO": "Código",
+            "DESCRICAO": "Descrição",
+            "SALDO_UNICA": "Saldo Única",
+            "QTD_VENDIDA_LOJA": "Qtd. Vendida na Loja",
+            "PCT_PARTICIPACAO": "% Participação",
+            "SUGESTAO_REALOCAR": "Sugestão de Envio",
+            "ULTIMA_VENDA_LOJA": "Última Venda",
+            "VALOR_VENDIDO_LOJA": "Valor Vendido",
+            "CLIENTES_REFERENCIA": "Clientes de Referência",
+        }
+    )
+
+    st.dataframe(
+        tabela.sort_values(by=["Sugestão de Envio", "Qtd. Vendida na Loja", "Última Venda"], ascending=[False, False, False]),
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "Código": st.column_config.NumberColumn(format="%d"),
+            "Descrição": st.column_config.TextColumn(width="large"),
+            "Saldo Única": st.column_config.NumberColumn(format="%.0f"),
+            "Qtd. Vendida na Loja": st.column_config.NumberColumn(format="%.0f"),
+            "% Participação": st.column_config.NumberColumn(format="%.2f%%"),
+            "Sugestão de Envio": st.column_config.NumberColumn(format="%.0f"),
+            "Valor Vendido": st.column_config.NumberColumn(format="R$ %.2f"),
+            "Clientes de Referência": st.column_config.TextColumn(width="large"),
+        },
+    )
+
+    csv_loja = tabela.to_csv(index=False).encode("utf-8-sig")
+    st.download_button(
+        f"Baixar CSV da loja {loja_escolhida}",
+        data=csv_loja,
+        file_name=f"realocacao_sky_{loja_escolhida.lower().replace(' ', '_')}.csv",
+        mime="text/csv",
+    )
+
+    st.markdown("---")
+    st.subheader("Resumo geral da metodologia")
+    st.write(
+        """
+        A sugestão é calculada SKU a SKU:
+        1. pega o saldo disponível na Única;
+        2. busca quanto cada loja vendeu daquele SKU no histórico;
+        3. calcula a participação de cada loja no total vendido;
+        4. distribui o saldo da Única proporcionalmente a essa participação, fechando em números inteiros.
+        """
+    )
+
+    with st.expander("Exemplo de cálculo"):
+        st.write(
+            """
+            Se um SKU tem saldo 18 na Única e o histórico mostra:
+            - Gama: 5 unidades
+            - Luziânia: 5 unidades
+
+            Então cada loja representa 50% das vendas desse SKU.
+            A sugestão fica:
+            - Gama: 9 unidades
+            - Luziânia: 9 unidades
+            """
+        )
+
+    st.markdown("### Visão geral por loja")
+    resumo_lojas = (
+        geral.groupby("LOJA", dropna=False)
+        .agg(
+            SKUS=("CODIGO", "nunique"),
+            UNIDADES_SUGERIDAS=("SUGESTAO_REALOCAR", "sum"),
+            QTD_HISTORICA=("QTD_VENDIDA_LOJA", "sum"),
+        )
+        .reset_index()
+        .sort_values(by=["UNIDADES_SUGERIDAS", "QTD_HISTORICA", "LOJA"], ascending=[False, False, True])
+        .rename(
+            columns={
+                "LOJA": "Loja",
+                "SKUS": "SKUs",
+                "UNIDADES_SUGERIDAS": "Unidades Sugeridas",
+                "QTD_HISTORICA": "Qtd. Histórica",
+            }
+        )
+    )
+
+    st.dataframe(
+        resumo_lojas,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "SKUs": st.column_config.NumberColumn(format="%d"),
+            "Unidades Sugeridas": st.column_config.NumberColumn(format="%.0f"),
+            "Qtd. Histórica": st.column_config.NumberColumn(format="%.0f"),
+        },
+    )
 
 
 giro, produtos = carregar_dados()
 
 pagina = st.sidebar.radio(
     "Navegação",
-    ["Estoque + Drill", "Direcionamento por SKU"],
+    ["Estoque + Drill", "Direcionamento por SKU", "Realocação por Loja"],
     index=0,
 )
 
 if pagina == "Estoque + Drill":
     render_pagina_estoque(giro, produtos)
-else:
+elif pagina == "Direcionamento por SKU":
     render_pagina_direcionamento(giro, produtos)
+else:
+    render_pagina_realocacao(giro, produtos)
