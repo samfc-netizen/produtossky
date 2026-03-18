@@ -261,8 +261,8 @@ def gerar_realocacao(giro: pd.DataFrame, produtos: pd.DataFrame):
         .rename(columns={"CÓD": "CODIGO"})
     )
 
-    # lojas elegíveis para receber realocação: vendas históricas fora da ÚNICA
-    vendas_loja_sku = vendas_loja_sku[vendas_loja_sku["LOJA"].str.upper() != "ÚNICA"].copy()
+    # lojas elegíveis para receber realocação: todas as lojas que tiveram venda histórica,
+    # incluindo a própria ÚNICA quando houver tração nela.
     vendas_loja_sku = vendas_loja_sku[vendas_loja_sku["QTD_VENDIDA"] > 0].copy()
 
     base = produtos_base.merge(vendas_loja_sku, on="CODIGO", how="left")
@@ -293,7 +293,8 @@ def gerar_realocacao(giro: pd.DataFrame, produtos: pd.DataFrame):
         grp_valid["PCT_PARTICIPACAO"] = grp_valid["QTD_VENDIDA"] / total_vendido if total_vendido > 0 else 0
 
         # Cliente mais representativo e mais recente por loja/SKU
-        vendas_prod = giro[(giro["CÓD"] == codigo) & (giro["LOJA"].str.upper() != "ÚNICA")].copy()
+        # Aqui a ÚNICA também entra quando ela teve tração no histórico.
+        vendas_prod = giro[giro["CÓD"] == codigo].copy()
         clientes_loja = (
             vendas_prod.groupby(["LOJA", "CLIENTE"], dropna=False)
             .agg(
@@ -703,10 +704,10 @@ def render_pagina_realocacao(giro: pd.DataFrame, produtos: pd.DataFrame):
     geral, lojas_disponiveis = gerar_realocacao(giro, produtos)
 
     st.title("Sky - Sugestão de Realocação por Loja")
-    st.caption("Distribuição proporcional do saldo da Única entre as lojas, com base no histórico de quantidade vendida por SKU.")
+    st.caption("Distribuição proporcional do saldo da Única entre as lojas, com base no histórico de quantidade vendida por SKU, incluindo a própria ÚNICA quando ela também teve tração.")
 
     if geral.empty:
-        st.warning("Não encontrei SKUs com saldo na Única e vendas históricas fora da loja ÚNICA para sugerir realocação.")
+        st.warning("Não encontrei SKUs com saldo na Única e vendas históricas para sugerir realocação.")
         return
 
     with st.sidebar:
@@ -791,7 +792,7 @@ def render_pagina_realocacao(giro: pd.DataFrame, produtos: pd.DataFrame):
         """
         A sugestão é calculada SKU a SKU:
         1. pega o saldo disponível na Única;
-        2. busca quanto cada loja vendeu daquele SKU no histórico;
+        2. busca quanto cada loja vendeu daquele SKU no histórico, incluindo a própria ÚNICA quando ela teve tração;
         3. calcula a participação de cada loja no total vendido;
         4. distribui o saldo da Única proporcionalmente a essa participação, fechando em números inteiros.
         """
@@ -808,7 +809,23 @@ def render_pagina_realocacao(giro: pd.DataFrame, produtos: pd.DataFrame):
             A sugestão fica:
             - Gama: 9 unidades
             - Luziânia: 9 unidades
-            """
+
+            Se a própria ÚNICA também vendeu o SKU no histórico, ela entra na divisão proporcional como destino.
+            Exemplo:
+            - ÚNICA: 6 unidades
+            - Gama: 3 unidades
+            - Luziânia: 3 unidades
+
+            Participação:
+            - ÚNICA: 50%
+            - Gama: 25%
+            - Luziânia: 25%
+
+            Com saldo 18, a sugestão fica:
+            - ÚNICA: 9 unidades
+            - Gama: 4 ou 5 unidades
+            - Luziânia: 4 ou 5 unidades
+                        """
         )
 
     st.markdown("### Visão geral por loja")
